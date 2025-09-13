@@ -3,7 +3,6 @@ import tempfile
 import subprocess
 from pathlib import Path
 import re
-import time
 import imageio_ffmpeg
 
 st.set_page_config(page_title="YouTube Clip Extractor", page_icon="✂️", layout="centered")
@@ -30,25 +29,31 @@ def parse_timecode(tc: str) -> float:
 def popen_stream(cmd: list):
     """ Lance un subprocess et stream les logs ligne par ligne. """
     return subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
 
-# ----------------- Téléchargement (avec jauge) -----------------
-def download_with_progress(url: str, outdir: Path, prefer_format: str, force_ipv4: bool, cookies_file: Path|None,
-                           progress_bar, status_text, log_area) -> Path:
-    format_map = {
-        "auto-mp4": "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "format-18": "18",  # 360p mp4 super-compatible
+# ----------------- Téléchargement (avec jauge + qualité) -----------------
+def download_with_progress(
+    url: str,
+    outdir: Path,
+    quality: str,
+    force_ipv4: bool,
+    cookies_file: Path | None,
+    progress_bar,
+    status_text,
+    log_area
+) -> Path:
+    # Map qualité → formats YouTube stables (MP4/H.264 + M4A)
+    quality_map = {
+        "Haute (1080p max)":  "bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
+        "Moyenne (720p max)": "bestvideo[height<=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
+        "Basse (360p)":       "bestvideo[height<=360][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best",
     }
-    chosen_format = format_map[prefer_format]
+    chosen_format = quality_map[quality]
 
     cmd = [
         "yt-dlp",
-        "--newline",                   # <- indispensable pour avoir des lignes de progression régulières
+        "--newline",                          # progression en temps réel
         "--ffmpeg-location", FFMPEG_BIN,
         "-f", chosen_format,
         "--merge-output-format", "mp4",
@@ -69,17 +74,13 @@ def download_with_progress(url: str, outdir: Path, prefer_format: str, force_ipv
     pct = 0
     progress_bar.progress(pct)
     last_lines = []
-
-    # yt-dlp produit des lignes du style: "[download]  12.3% of ..."
     pct_re = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 
     for line in proc.stdout:
         line = line.rstrip()
-        if not line:
-            continue
+        if not line: continue
         last_lines.append(line)
-        if len(last_lines) > 8:
-            last_lines.pop(0)
+        if len(last_lines) > 8: last_lines.pop(0)
         log_area.code("\n".join(last_lines), language="text")
 
         m = pct_re.search(line)
@@ -103,16 +104,18 @@ def download_with_progress(url: str, outdir: Path, prefer_format: str, force_ipv
     return mp4s[0]
 
 # ----------------- Coupe (avec jauge) -----------------
-def clip_with_progress(src: Path, start: float, end: float, dest: Path, reencode: bool,
-                       progress_bar, status_text, log_area):
-    duration = max(0.01, end - start)  # en secondes
-    # On utilise -progress pipe:1 pour des lignes "out_time_ms=..."
-    base = [
-        FFMPEG_BIN, "-y",
-        "-ss", f"{start:.3f}",
-        "-i", str(src),
-        "-t", f"{duration:.3f}",
-    ]
+def clip_with_progress(
+    src: Path,
+    start: float,
+    end: float,
+    dest: Path,
+    reencode: bool,
+    progress_bar,
+    status_text,
+    log_area
+):
+    duration = max(0.01, end - start)  # sec
+    base = [FFMPEG_BIN, "-y", "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}"]
     if reencode:
         base += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-c:a", "aac", "-b:a", "192k"]
     else:
@@ -130,18 +133,16 @@ def clip_with_progress(src: Path, start: float, end: float, dest: Path, reencode
 
     for line in proc.stdout:
         line = line.strip()
-        if not line:
-            continue
+        if not line: continue
         last_lines.append(line)
-        if len(last_lines) > 8:
-            last_lines.pop(0)
+        if len(last_lines) > 8: last_lines.pop(0)
         log_area.code("\n".join(last_lines), language="text")
 
         m = out_time_re.match(line)
         if m:
             try:
                 out_ms = int(m.group(1))
-                cur = out_ms / 1_000_000.0  # en secondes
+                cur = out_ms / 1_000_000.0
                 pct = min(100, max(0, (cur / duration) * 100))
                 progress_bar.progress(int(pct))
                 status_text.write(f"Découpe en cours… {pct:.0f}%")
@@ -165,10 +166,10 @@ with st.form("clip_form"):
         end_tc   = st.text_input("Fin",   placeholder="2:10 | 01:03:05 | 130 | 2m10s")
     reencode   = st.toggle("Coupe précise (réencodage, plus lent)", value=False)
     force_ipv4 = st.toggle("Forcer IPv4 (utile si 403)", value=True)
-    prefer_format = st.selectbox(
-        "Profil de téléchargement",
-        ["auto-mp4", "format-18"],
-        help="auto-mp4: meilleure qualité MP4/H.264 possible. format-18: 360p très compatible."
+    quality_choice = st.selectbox(
+        "Qualité vidéo",
+        ["Haute (1080p max)", "Moyenne (720p max)", "Basse (360p)"],
+        help="Choisis la résolution maximale souhaitée."
     )
     cookies_upload = st.file_uploader("Cookies (facultatif) – fichier Netscape cookies.txt", type=["txt"])
     submit = st.form_submit_button("Extraire l’extrait")
@@ -198,10 +199,18 @@ if submit:
                     st.subheader("Logs")
                     log_area = st.empty()
 
-                    # 1) Téléchargement avec jauge
+                    # 1) Téléchargement avec jauge + qualité
                     src = download_with_progress(
-                        url, tdp, prefer_format, force_ipv4, cookies_path,
+                        url, tdp, quality_choice, force_ipv4, cookies_path,
                         progress_bar=dl_bar, status_text=dl_status, log_area=log_area
+                    )
+
+                    # (optionnel) proposer la vidéo complète source
+                    st.download_button(
+                        "⬇️ Télécharger la vidéo complète (source)",
+                        data=open(src, "rb"),
+                        file_name="video_complete.mp4",
+                        mime="video/mp4",
                     )
 
                     # 2) Découpe avec jauge
@@ -218,4 +227,4 @@ if submit:
 
         except Exception as e:
             st.error(f"Erreur: {e}")
-            st.caption("Si 403 persiste : essaie “format-18”, force IPv4, ou fournis un cookies.txt (vidéos restreintes).")
+            st.caption("Si 403 persiste : essaye “Basse (360p)”, force IPv4, ou fournis un cookies.txt (vidéos restreintes).")
