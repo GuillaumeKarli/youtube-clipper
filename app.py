@@ -4,17 +4,21 @@ import subprocess
 from pathlib import Path
 import re
 import traceback
-import hashlib, time, os
+import hashlib, time, os, shutil
 
 # ========= Config UI =========
 st.set_page_config(page_title="YouTube Clip Extractor", page_icon="✂️", layout="centered")
 st.title("✂️ YouTube Clip Extractor")
 st.caption("Colle une URL YouTube + timecodes de début/fin → télécharge un extrait (MP4).")
 
+# ========= Dossier de cache persistant (sur le disque) =========
+CACHE_DIR = Path("./cache_sources")
+CACHE_DIR.mkdir(exist_ok=True)
+
 # ========= FFMPEG (robuste) =========
 FFMPEG_BIN = None
 def get_ffmpeg_path():
-    """Tente d'utiliser le binaire fourni par imageio-ffmpeg, sinon 'ffmpeg' du PATH."""
+    """Tente d'utiliser le binaire d'imageio-ffmpeg, sinon 'ffmpeg' du PATH."""
     global FFMPEG_BIN
     if FFMPEG_BIN:
         return FFMPEG_BIN
@@ -25,11 +29,11 @@ def get_ffmpeg_path():
         FFMPEG_BIN = "ffmpeg"
     return FFMPEG_BIN
 
-# ========= Diagnostics (sidebar) =========
+# ========= Diagnostics (sidebar) + purge cache =========
 with st.sidebar:
     st.markdown("### 🧪 Diagnostics")
     try:
-        import sys, shutil
+        import sys
         st.write("Python:", sys.version.split()[0])
         yv = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
         st.write("yt-dlp:", (yv.stdout or yv.stderr).strip())
@@ -39,7 +43,18 @@ with st.sidebar:
     except Exception as e:
         st.error(f"Diag error: {e}")
 
-# ========= Cache (session) =========
+    st.markdown("---")
+    if st.button("🧹 Vider le cache des sources"):
+        try:
+            for p in CACHE_DIR.glob("*.mp4"):
+                p.unlink(missing_ok=True)
+            if "dl_cache" in st.session_state:
+                st.session_state.dl_cache.clear()
+            st.success("Cache vidé.")
+        except Exception as e:
+            st.error(f"Impossible de vider le cache : {e}")
+
+# ========= Cache (session) pour mémo/LRU =========
 if "dl_cache" not in st.session_state:
     # key -> {"url","quality","force_ipv4","cookies_sha1","path","size","ts"}
     st.session_state.dl_cache = {}
@@ -165,7 +180,7 @@ def download_with_progress(
     status_text.write("Téléchargement terminé ✅")
     return mp4s[0]
 
-# ========= Wrapper cache =========
+# ========= Wrapper cache (utilise cache persistant ./cache_sources/) =========
 def get_or_download(
     url: str,
     outdir: Path,
@@ -176,28 +191,38 @@ def get_or_download(
 ) -> Path:
     csha = sha1_file(cookies_path)
     key  = make_cache_key(url, quality_choice, force_ipv4, csha)
-    cached = get_from_cache(key)
-    if cached:
+    cache_mp4 = CACHE_DIR / f"{key}.mp4"
+
+    # 1) Si le fichier existe déjà en persistant, on l'utilise
+    if cache_mp4.exists() and cache_mp4.stat().st_size > 0:
         status_text.write("🗂️ Source trouvée en cache — pas de nouveau téléchargement.")
         progress_bar.progress(100)
-        log_area.code(f"[cache] {cached['url']} ({cached['quality']}, {cached['size']//1024//1024} MB)", language="text")
-        return Path(cached["path"])
+        entry = {
+            "url": url, "quality": quality_choice, "force_ipv4": force_ipv4,
+            "cookies_sha1": csha, "path": str(cache_mp4),
+            "size": cache_mp4.stat().st_size, "ts": time.time()
+        }
+        add_to_cache(key, entry)
+        log_area.code(f"[cache] {entry['url']} ({entry['quality']}, {entry['size']//1024//1024} MB)", language="text")
+        return cache_mp4
 
-    src = download_with_progress(
+    # 2) Sinon, on télécharge puis on copie vers le cache persistant
+    tmp_src = download_with_progress(
         url, outdir, quality_choice, force_ipv4, cookies_path,
         progress_bar=progress_bar, status_text=status_text, log_area=log_area
     )
+    try:
+        shutil.move(str(tmp_src), str(cache_mp4))
+    except Exception:
+        shutil.copy2(str(tmp_src), str(cache_mp4))
+
     entry = {
-        "url": url,
-        "quality": quality_choice,
-        "force_ipv4": force_ipv4,
-        "cookies_sha1": csha,
-        "path": str(src),
-        "size": os.path.getsize(src),
-        "ts": time.time(),
+        "url": url, "quality": quality_choice, "force_ipv4": force_ipv4,
+        "cookies_sha1": csha, "path": str(cache_mp4),
+        "size": cache_mp4.stat().st_size, "ts": time.time(),
     }
     add_to_cache(key, entry)
-    return src
+    return cache_mp4
 
 # ========= Découpe (jauge) =========
 def clip_with_progress(
@@ -253,27 +278,27 @@ def clip_with_progress(
     progress_bar.progress(100)
     status_text.write("Découpe terminée ✅")
 
+# ========= Mémo visuel des sources =========
+with st.expander("🗂️ Mémo des sources déjà téléchargées"):
+    items = sorted(st.session_state.dl_cache.values(), key=lambda e: e["ts"], reverse=True)
+    if not items:
+        st.caption("Aucune source en cache pour l’instant.")
+    else:
+        for i, e in enumerate(items, 1):
+            cols = st.columns([6,2,2,2])
+            with cols[0]:
+                st.write(f"**{i}.** {e['url']}")
+                st.caption(f"{e['quality']} • {e['size']//1024//1024} MB • {time.strftime('%H:%M:%S', time.localtime(e['ts']))}")
+            with cols[1]:
+                if st.button("Recharger URL", key=f"reuse_{i}"):
+                    st.session_state["prefill_url"] = e["url"]
+            with cols[2]:
+                st.write("IPv4:", "Oui" if e["force_ipv4"] else "Non")
+            with cols[3]:
+                st.write("Cookies:", "Oui" if e["cookies_sha1"] else "Non")
+
 # ========= UI principale =========
 try:
-    # Mémo visuel du cache (optionnel)
-    with st.expander("🗂️ Mémo des sources déjà téléchargées (session)"):
-        items = sorted(st.session_state.dl_cache.values(), key=lambda e: e["ts"], reverse=True)
-        if not items:
-            st.caption("Aucune source en cache pour l’instant.")
-        else:
-            for i, e in enumerate(items, 1):
-                cols = st.columns([6,2,2,2])
-                with cols[0]:
-                    st.write(f"**{i}.** {e['url']}")
-                    st.caption(f"{e['quality']} • {e['size']//1024//1024} MB • {time.strftime('%H:%M:%S', time.localtime(e['ts']))}")
-                with cols[1]:
-                    if st.button("Recharger URL", key=f"reuse_{i}"):
-                        st.session_state["prefill_url"] = e["url"]
-                with cols[2]:
-                    st.write("IPv4:", "Oui" if e["force_ipv4"] else "Non")
-                with cols[3]:
-                    st.write("Cookies:", "Oui" if e["cookies_sha1"] else "Non")
-
     with st.form("clip_form"):
         default_url = st.session_state.get("prefill_url", "")
         url = st.text_input("URL YouTube", value=default_url, placeholder="https://www.youtube.com/watch?v=...")
@@ -316,7 +341,7 @@ try:
                         st.subheader("Logs")
                         log_area = st.empty()
 
-                        # Téléchargement (avec cache)
+                        # Téléchargement (avec cache persistant)
                         src = get_or_download(
                             url, tdp, quality_choice, force_ipv4, cookies_path,
                             progress_bar=dl_bar, status_text=dl_status, log_area=log_area
@@ -346,6 +371,6 @@ try:
                 st.error(f"Erreur: {e}")
                 st.exception(e)
 
-except Exception as boot_e:
+except Exception:
     st.error("Erreur au démarrage de l'app.")
     st.code("".join(traceback.format_exc()))
