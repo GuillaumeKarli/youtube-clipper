@@ -13,7 +13,7 @@ st.caption("Colle une URL YouTube + timecodes de début/fin → télécharge un 
 
 # ========= Dossier de cache persistant (Cloud) =========
 # IMPORTANT: /mount/data est l'espace persistant sur Streamlit Cloud
-CACHE_DIR = Path("/mount/data/cache_sources")
+CACHE_DIR = Path("/tmp/cache_sources")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========= FFMPEG (robuste) =========
