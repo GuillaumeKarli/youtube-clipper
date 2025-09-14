@@ -11,9 +11,10 @@ st.set_page_config(page_title="YouTube Clip Extractor", page_icon="✂️", layo
 st.title("✂️ YouTube Clip Extractor")
 st.caption("Colle une URL YouTube + timecodes de début/fin → télécharge un extrait (MP4).")
 
-# ========= Dossier de cache persistant (sur le disque) =========
-CACHE_DIR = Path("./cache_sources")
-CACHE_DIR.mkdir(exist_ok=True)
+# ========= Dossier de cache persistant (Cloud) =========
+# IMPORTANT: /mount/data est l'espace persistant sur Streamlit Cloud
+CACHE_DIR = Path("/mount/data/cache_sources")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========= FFMPEG (robuste) =========
 FFMPEG_BIN = None
@@ -89,6 +90,21 @@ def get_from_cache(key: str) -> dict|None:
         return None
     e["ts"] = time.time()  # LRU touch
     return e
+
+# ========= Recharger le mémo depuis le disque (patch n°3) =========
+# Permet de revoir les sources même après restart/redeploy
+for p in sorted(CACHE_DIR.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True):
+    key = p.stem  # hash généré par make_cache_key
+    if key not in st.session_state.dl_cache:
+        st.session_state.dl_cache[key] = {
+            "url": "(inconnue – clé="+key[:7]+")",
+            "quality": "(?)",
+            "force_ipv4": True,
+            "cookies_sha1": "",
+            "path": str(p),
+            "size": p.stat().st_size,
+            "ts": p.stat().st_mtime,
+        }
 
 # ========= Utilitaires =========
 def parse_timecode(tc: str) -> float:
@@ -180,7 +196,7 @@ def download_with_progress(
     status_text.write("Téléchargement terminé ✅")
     return mp4s[0]
 
-# ========= Wrapper cache (utilise cache persistant ./cache_sources/) =========
+# ========= Wrapper cache (patch n°1 & n°2) =========
 def get_or_download(
     url: str,
     outdir: Path,
@@ -195,7 +211,7 @@ def get_or_download(
 
     # 1) Si le fichier existe déjà en persistant, on l'utilise
     if cache_mp4.exists() and cache_mp4.stat().st_size > 0:
-        status_text.write("🗂️ Source trouvée en cache — pas de nouveau téléchargement.")
+        status_text.markdown("**Cache HIT** · 🗂️ Source trouvée — pas de nouveau téléchargement.")
         progress_bar.progress(100)
         entry = {
             "url": url, "quality": quality_choice, "force_ipv4": force_ipv4,
@@ -207,6 +223,7 @@ def get_or_download(
         return cache_mp4
 
     # 2) Sinon, on télécharge puis on copie vers le cache persistant
+    status_text.markdown("**Cache MISS** · Téléchargement de la source…")
     tmp_src = download_with_progress(
         url, outdir, quality_choice, force_ipv4, cookies_path,
         progress_bar=progress_bar, status_text=status_text, log_area=log_area
@@ -341,7 +358,7 @@ try:
                         st.subheader("Logs")
                         log_area = st.empty()
 
-                        # Téléchargement (avec cache persistant)
+                        # Téléchargement (avec cache persistant /mount/data)
                         src = get_or_download(
                             url, tdp, quality_choice, force_ipv4, cookies_path,
                             progress_bar=dl_bar, status_text=dl_status, log_area=log_area
