@@ -3,7 +3,7 @@ import subprocess
 from pathlib import Path
 import re
 import traceback
-import hashlib, time, os, shutil, zipfile, uuid, tempfile
+import hashlib, time, os, shutil, zipfile, uuid, tempfile, json
 
 # =============== Config UI ===============
 st.set_page_config(page_title="YouTube Clip Extractor", page_icon="✂️", layout="centered")
@@ -27,7 +27,7 @@ if "last_src" not in st.session_state:
     st.session_state.last_src = None
     st.session_state.last_output_profile = None
 
-# =============== FFMPEG (robuste) ===============
+# =============== FFMPEG / FFPROBE (robuste) ===============
 FFMPEG_BIN = None
 def get_ffmpeg_path():
     global FFMPEG_BIN
@@ -40,6 +40,21 @@ def get_ffmpeg_path():
         FFMPEG_BIN = "ffmpeg"
     return FFMPEG_BIN
 
+def get_ffprobe_path():
+    """Essaie d'utiliser ffprobe à côté du ffmpeg trouvé, sinon 'ffprobe' du PATH."""
+    ff = get_ffmpeg_path()
+    # si chemin complet vers ffmpeg, on tente le binaire sibling 'ffprobe'
+    p = Path(ff)
+    if p.name.lower().startswith("ffmpeg") and p.parent.exists():
+        candidate = p.parent / p.name.lower().replace("ffmpeg", "ffprobe")
+        if candidate.exists():
+            return str(candidate)
+        # autre variante: sans extension
+        candidate = p.parent / "ffprobe"
+        if candidate.exists():
+            return str(candidate)
+    return "ffprobe"
+
 # =============== Diagnostics + maintenance ===============
 with st.sidebar:
     st.markdown("### 🧪 Diagnostics")
@@ -48,9 +63,8 @@ with st.sidebar:
         st.write("Python:", sys.version.split()[0])
         yv = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
         st.write("yt-dlp:", (yv.stdout or yv.stderr).strip())
-        ff = get_ffmpeg_path()
-        st.write("ffmpeg path:", ff)
-        st.write("ffmpeg in PATH:", bool(shutil.which("ffmpeg")))
+        st.write("ffmpeg path:", get_ffmpeg_path())
+        st.write("ffprobe path:", get_ffprobe_path())
         st.write("workdir:", str(st.session_state.workdir))
         st.write("clips en session:", len(st.session_state.generated_files))
     except Exception as e:
@@ -70,7 +84,7 @@ with st.sidebar:
             shutil.rmtree(st.session_state.workdir, ignore_errors=True)
         except Exception:
             pass
-        for k in ["workdir", "generated_files", "last_src", "last_output_profile"]:
+        for k in ["workdir", "generated_files", "last_src", "last_output_profile", "dl_cache", "prefill_url"]:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -157,8 +171,7 @@ def parse_segments_lines(text: str):
             a, b = line.split(" to ", 1)
         else:
             raise ValueError(f"Ligne invalide (attendu 'de - à'): {line}")
-        s = parse_timecode(a.strip())
-        e = parse_timecode(b.strip())
+        s = parse_timecode(a.strip()); e = parse_timecode(b.strip())
         if e <= s:
             raise ValueError(f"Fin <= début pour la ligne: {line}")
         segs.append((s, e))
@@ -337,27 +350,77 @@ def clip_with_progress(src: Path, start: float, end: float, dest: Path, reencode
     progress_bar.progress(100)
     status_text.write("Découpe terminée ✅")
 
-# =============== Concat (montage) ===============
+# =============== Concat (montage) — ROBUSTE (audio optionnel) ===============
+def _has_audio_stream(path: Path) -> bool:
+    """Retourne True si le fichier a au moins une piste audio (via ffprobe)."""
+    ffprobe = get_ffprobe_path()
+    cmd = [ffprobe, "-v", "error", "-select_streams", "a",
+           "-show_entries", "stream=index", "-of", "json", str(path)]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(out.stdout or "{}")
+        return bool(data.get("streams"))
+    except Exception:
+        return False  # prudence: on n’échoue pas si ffprobe n’est pas dispo
+
 def concat_videos_ffmpeg(inputs: list[Path], dest: Path, target_height: int|None = None, crf: int = 23):
+    """
+    Concat robuste :
+      - ré-encode tout en H.264/AAC
+      - si un des inputs n'a pas d'audio, on concatène vidéo seule (a=0) pour éviter l'échec.
+    """
+    if not inputs:
+        raise RuntimeError("Aucun input à concaténer.")
     ff = get_ffmpeg_path()
+
+    audio_flags = [_has_audio_stream(p) for p in inputs]
+    all_have_audio = all(audio_flags)
+
     cmd = [ff, "-y"]
-    for p in inputs: cmd += ["-i", str(p)]
+    for p in inputs:
+        cmd += ["-i", str(p)]
+
     n = len(inputs)
     scale = f",scale=-2:{target_height}" if target_height else ""
-    filt = ""
+    filt_parts = []
+
+    # Vidéo: normalisation fps/format/scale
     for i in range(n):
-        filt += f"[{i}:v]fps=30{scale},format=yuv420p[v{i}];"
-        filt += f"[{i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a{i}];"
-    v_in = "".join([f"[v{i}]" for i in range(n)])
-    a_in = "".join([f"[a{i}]" for i in range(n)])
-    filt += f"{v_in}{a_in}concat=n={n}:v=1:a=1[v][a]"
-    cmd += ["-filter_complex", filt, "-map", "[v]", "-map", "[a]",
+        filt_parts.append(f"[{i}:v]fps=30{scale},format=yuv420p[v{i}]")
+
+    if all_have_audio:
+        for i in range(n):
+            filt_parts.append(f"[{i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a{i}]")
+        v_in = "".join([f"[v{i}]" for i in range(n)])
+        a_in = "".join([f"[a{i}]" for i in range(n)])
+        filt_parts.append(f"{v_in}{a_in}concat=n={n}:v=1:a=1[v][a]")
+        cmd += [
+            "-filter_complex", ";".join(filt_parts),
+            "-map", "[v]", "-map", "[a]",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
-            "-c:a", "aac", "-b:a", "160k", str(dest)]
+            "-c:a", "aac", "-b:a", "160k",
+            str(dest)
+        ]
+    else:
+        v_in = "".join([f"[v{i}]" for i in range(n)])
+        filt_parts.append(f"{v_in}concat=n={n}:v=1:a=0[v]")
+        cmd += [
+            "-filter_complex", ";".join(filt_parts),
+            "-map", "[v]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+            str(dest)
+        ]
+
     proc = popen_stream(cmd)
-    for _ in proc.stdout: pass
-    if proc.wait() != 0:
-        raise RuntimeError("Echec concaténation ffmpeg.")
+    last_lines = []
+    for line in proc.stdout:
+        if line:
+            last_lines.append(line.rstrip())
+            if len(last_lines) > 20:
+                last_lines.pop(0)
+    ret = proc.wait()
+    if ret != 0:
+        raise RuntimeError("Echec concaténation ffmpeg.\n" + "\n".join(last_lines))
 
 # =============== Mémo visuel des sources ===============
 with st.expander("🗂️ Mémo des sources déjà téléchargées"):
